@@ -373,20 +373,7 @@ class StripeCheckoutView(generics.CreateAPIView):
             return redirect(checkout_session.url)
         except stripe.error.StripeError as e:
             return Response({"error": f"Error processing payment: {str(e)}", "icon": "error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-def get_access_token(client_id, secret_key):
-    # Function to get access token from PayPal API
-    token_url = 'https://api.sandbox.paypal.com/v1/oauth2/token'
-    data = {'grant_type': 'client_credentials'}
-    auth = (client_id, secret_key)
-    response = requests.post(token_url, data=data, auth=auth)
-
-    if response.status_code == 200:
-        print("access_token ====", response.json()['access_token'])
-        return response.json()['access_token']
-    else:
-        raise Exception(f'Failed to get access token from PayPal. Status code: {response.status_code}') 
-         
+    
 class PaymentSuccessView(generics.CreateAPIView):
     serializer_class = CartOrderSerializer
     queryset = CartOrder.objects.all()
@@ -395,52 +382,84 @@ class PaymentSuccessView(generics.CreateAPIView):
         payload = request.data
         order_oid = payload.get('order_oid')
         session_id = payload.get('session_id')
+
         if not order_oid or not session_id:
             return Response({'error': 'Missing order_oid or session_id'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Fetch the order
         order = get_object_or_404(CartOrder, oid=order_oid)
         order_items = CartOrderItem.objects.filter(order=order)
 
-        try:
-            session = stripe.checkout.Session.retrieve(session_id)
-        except Exception as e:
-            return Response({'error': 'Invalid session_id', 'details': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        if session_id and session_id != "null":
+            try:
+                session = stripe.checkout.Session.retrieve(session_id)
+            except Exception as e:
+                return Response({"error": "Failed to retrieve Stripe session."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if session.payment_status == 'paid':
-            if order.payment_status == "pending":
-                order.payment_status = "paid"
-                order.save()
+            payment_status = session.get("payment_status", "").lower()
 
-                if order.buyer != None:
-                    send_notification(user = order.buyer, order=order)
+            if payment_status == "paid":
+                if order.payment_status == "pending":
+                    # Mark the order as paid
+                    order.payment_status = "paid"
+                    order.save()
 
-                for o in order_items:
-                    send_notification(vendor=o.vendor, order=order, order_item=o)
+                    # Send customer confirmation email
+                    self.send_customer_email(order, order_items)
 
-                context = {
-                    'order':order,
-                     'order_items':order_items
-                }
-                subject = "Order Placed Successfully"
-                text_body = render_to_string("email/customer_order_confirmation.txt", context)
-                html_body = render_to_string("email/customer_order_confirmation.html", context)
+                    # Notify buyer
+                    if order.buyer:
+                        send_notification(user=order.buyer, order=order)
 
-                msg = EmailMultiAlternatives(
-                    subject=subject,
-                    from_email = settings.EMAIL_HOST_USER,
-                    to=[order.email],
-                    body = text_body
-                )
-                msg.attach_alternative(html_body,"text/html")
-                msg.send()
+                    # Notify vendors and send sale email
+                    for item in order_items:
+                        send_notification(vendor=item.vendor, order=order, order_item=item)
+                        self.send_vendor_email(item.vendor, order, order_items)
 
-                return Response({"message": "Payment Successful"}, status=status.HTTP_201_CREATED)
+                    return Response({"message": "Payment Successful"}, status=status.HTTP_201_CREATED)
+                else:
+                    return Response({"message": "Already Paid"}, status=status.HTTP_200_OK)
+
+            elif payment_status == "unpaid":
+                return Response({"message": "Your Invoice is unpaid"}, status=status.HTTP_200_OK)
+
+            elif payment_status == "canceled":
+                return Response({"message": "Your Invoice is Cancelled"}, status=status.HTTP_200_OK)
+
             else:
-                return Response({"message": "Already Paid"}, status=status.HTTP_200_OK)
-        elif session.payment_status == 'unpaid':
-            return Response({"message": "Your Invoice is unpaid"})
-        elif session.payment_status == 'cancelled':
-            return Response({"message": "Your Invoice is Cancelled"})
+                return Response({"message": "An error occurred, please try again."}, status=status.HTTP_400_BAD_REQUEST)
+
         else:
-            return Response({"message": "An error occured, Try again!!"})
-        return Response({"error": "Payment not completed"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Invalid session ID."}, status=status.HTTP_400_BAD_REQUEST)
+
+    def send_customer_email(self, order, order_items):
+        """Send order confirmation email to customer."""
+        context = {'order': order, 'order_items': order_items}
+        subject = "Order Placed Successfully"
+        text_body = render_to_string("email/customer_order_confirmation.txt", context)
+        html_body = render_to_string("email/customer_order_confirmation.html", context)
+
+        msg = EmailMultiAlternatives(
+            subject=subject,
+            from_email=os.getenv('EMAIL_HOST_USER'),
+            to=[order.email],
+            body=text_body
+        )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send()
+
+    def send_vendor_email(self, vendor, order, order_items):
+        """Send new sale email to vendor."""
+        context = {'order': order, 'order_items': order_items}
+        subject = "New Sale!"
+        text_body = render_to_string("email/vendor_order_sale.txt", context)
+        html_body = render_to_string("email/vendor_order_sale.html", context)
+
+        msg = EmailMultiAlternatives(
+            subject=subject,
+            from_email=os.getenv('EMAIL_HOST_USER'),
+            to=[vendor.user.email],
+            body=text_body
+        )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send()
